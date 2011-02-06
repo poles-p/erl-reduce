@@ -25,6 +25,17 @@ run(ReduceFunction) ->
     error_logger:info_msg("Reduce worker ~p started. Waiting for reduce "
                               "data...", [self()]),
     
+	reducer_main_loop(ReduceFunction).
+
+%%
+%% Local Functions.
+%%
+
+%% @doc Main loop of reduce worker.
+%% @spec ((IntermediateData) -> FinalData) -> () where
+%%     IntermediateData = {K2,[V2]},
+%%     FinalData = [{K3,V3}]
+reducer_main_loop(ReduceFunction) ->
 	CollectionResult = collect_reduce_data(),
 	case CollectionResult of
 		map_reducing_complete ->
@@ -37,12 +48,8 @@ run(ReduceFunction) ->
 								 [MasterPid]),
     		MasterPid ! {self(), {reduce_finished, ReduceResult}},
 			
-			run(ReduceFunction)
+			reducer_main_loop(ReduceFunction)
 	end.
-
-%%
-%% Local Functions.
-%%
 
 %% @doc Receives map results from mappers and collects them into accumulator 
 %%     (CollectedResultsDict) until receives start_reducing message from master.
@@ -62,7 +69,7 @@ collect_reduce_data_loop(CollectedResultsDict) ->
             
             NewCollectedResults = 
                 lists:foldl(fun({Key, Value}, Dict) ->
-                                    dict:append_list(Key, [Value], Dict)
+                                    dict:append_list(Key, [{MapperPid, Value}], Dict)
                             end, 
                             CollectedResultsDict, ReduceData),
             
@@ -76,8 +83,31 @@ collect_reduce_data_loop(CollectedResultsDict) ->
             error_logger:info_msg("Collected reduce data; received start "
                                       "signal from master (~p).",
                                   [MasterPid]),
+			
+			DataWithoutPids = dict:fold(
+								fun (Key, PidValueList, Acc) ->
+										 [{Key,lists:map(fun ({_, Value}) -> Value end, PidValueList)} | Acc]
+								end, [], CollectedResultsDict),
             
-            {data_collected, MasterPid, dict:to_list(CollectedResultsDict)};
+            {data_collected, MasterPid, DataWithoutPids};
+
+		{MasterPid, {cancel_data, MapperPids}} ->
+			error_logger:info_msg("Map worker failure. Cancel data from ~p.",
+                                  [MapperPids]),
+			
+			MasterPid ! {self(), data_canceled},
+			
+			NewCollectedResults =
+				dict:map(fun (_, PidValueList) ->
+								  lists:filter(fun ({Pid, _}) ->
+														lists:all(fun (DeadMapperPid) ->
+																		   DeadMapperPid /= Pid
+																  end, MapperPids)
+											   end,	PidValueList)
+						 end, CollectedResultsDict),
+			
+			collect_reduce_data_loop(NewCollectedResults);
+
 		{_, map_reducing_complete} ->
 			map_reducing_complete
     end.

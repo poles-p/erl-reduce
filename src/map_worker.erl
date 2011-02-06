@@ -29,7 +29,7 @@ run(MapFunction) ->
     MapResult = lists:flatten(MapResultList),
 
     error_logger:info_msg("Mapping finished; waiting for recipe..."),
-    wait_for_recipe(MapResult),
+    wait_for_recipe(MapFunction, MapResult),
 
     error_logger:info_msg("Map worker is going down."),
     ok.
@@ -38,6 +38,7 @@ run(MapFunction) ->
 %%
 %% Local Functions.
 %%
+
 
 
 %% @doc Waits for map_data message or mapping_phase_finished, because one mapper
@@ -65,10 +66,11 @@ map_data(MapFunction) ->
 
 
 %% @doc Waits for recipe message. When received one, sends data to reducers.
-%% @spec MapResult -> void() where
+%% @spec (MapFunction, MapResult) -> void() where
+%%      MapFunction = [{K1,V1}] -> [{K2,V3}],
 %%      MapResult = [{K1, [V1,V2,V3,...]}]
 %% @private
-wait_for_recipe(MapResult) ->
+wait_for_recipe(MapFunction, MapResult) ->
     receive
         {MasterPid, {recipe, Recipe}} ->
             error_logger:info_msg("Received recipe; splitting data..."),
@@ -86,17 +88,22 @@ wait_for_recipe(MapResult) ->
             error_logger:info_msg("Notifying master that mapper ~p is done.",
                                   [self()]),
             MasterPid ! {self(), map_send_finished},
-            additional_reduce_phase(ReducerPidsWithData) 
+            additional_reduce_phase(MapFunction, ReducerPidsWithData, Recipe, []) 
     end.
+
 
 
 %% @doc Waits for 'map_reducing_complete' message, or additional recipe.
 %%     If receives additional recipe, start additional reduce phase.
 %%     See the documentation for protocol definition.
-%% @spec (OldPartition) -> () where
-%%     OldPartition = dict()
+%% @spec (MapFunction, OldPartition, FirstRecipe, AdditionalRecipes) -> () where
+%%     MapFunction = [{K1,V1}] -> [{K2,V3}],
+%%     OldPartition = dict(),
+%%     FirstRecipe = K2 -> ReducerPid,
+%%     AdditionalRecipes = [{DeadReducerPids, K2 -> ReducerPid}],
+%%     DeadReducerPids = [pid()]
 %% @private
-additional_reduce_phase(OldPartition) ->
+additional_reduce_phase(MapFunction, OldPartition, FirstRecipe, AdditionalRecipes) ->
 	receive
 		{_, map_reducing_complete} ->
 			error_logger:info_msg("Map-reducing finished. Quitting.", []);
@@ -119,7 +126,25 @@ additional_reduce_phase(OldPartition) ->
 			error_logger:info_msg("Notifying master mapper ~p is done.", [self()]),
                     MasterPid ! {self(), map_send_finished},
 			
-			additional_reduce_phase(ReducerPidsWithData) 
+			additional_reduce_phase(MapFunction, ReducerPidsWithData, FirstRecipe, [{DeadReducerPids, Recipe} | AdditionalRecipes]);
+		
+		{_, additional_map_phase} ->
+			error_logger:info_msg("Additiona map phase started, waiting for map data ..."),
+			AdditionalMapResultList = map_data(MapFunction),
+			AdditionalMapResult = lists:flatten(AdditionalMapResultList),
+			
+			AdditionalDataPartition = 
+				lists:foldr(fun ({DeadReducerPids, Recipe}, Partition) ->
+									 split_lost_data_among_reducers(Partition, DeadReducerPids, Recipe)
+							end, 
+							split_data_among_reducers(AdditionalMapResult, FirstRecipe), 
+							AdditionalRecipes),
+			
+			MergedPartition = dict:merge(fun (_, List1, List2) ->
+												  lists:append(List1, List2)
+										 end , AdditionalDataPartition, OldPartition),
+			
+			additional_reduce_phase(MapFunction, MergedPartition, FirstRecipe, AdditionalRecipes)
 	end.
 
 %% @doc Sends all data to reducers.
@@ -162,6 +187,7 @@ collect_acknowledgements_loop(RemainingReducerPids) ->
                         [ReducerPid, sets:to_list(NewRemainingReducerPids)]),
                     
                     collect_acknowledgements_loop(NewRemainingReducerPids);
+				
 				{ReducerPid, reduce_worker_down} ->
 					NewRemainingReducerPids = sets:del_element(
                                                 ReducerPid,
