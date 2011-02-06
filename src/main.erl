@@ -38,7 +38,7 @@ start() ->
             MapReduceResult
     end,
 
-    error_logger:info_msg("Map/reduce finished."),
+    error_logger:info_msg("Map/reduce finished. Lenght of result : ~p", [length(MapReduceResult)]),
     MapReduceResult.
 
 

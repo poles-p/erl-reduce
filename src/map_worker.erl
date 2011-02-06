@@ -108,27 +108,25 @@ additional_reduce_phase(MapFunction, OldPartition, FirstRecipe, AdditionalRecipe
 		{_, map_reducing_complete} ->
 			error_logger:info_msg("Map-reducing finished. Quitting.", []);
 	
-		{MasterPid, {recipe, Recipe, DeadReducerPids}} ->
+		{MasterPid, {recipe, Recipe, DeadReducerPids, AliveReducerPids}} ->
 			error_logger:info_msg("Received recipe; start additional reduce phase; splitting lost data..."),
 			
 			ReducerPidsWithData = split_lost_data_among_reducers(OldPartition, DeadReducerPids, Recipe),
 			
-			ReducerPids = dict:fetch_keys(ReducerPidsWithData),
-			
 			error_logger:info_msg("Sending data to reducers ~p...",
-                                          [ReducerPids]),
-			send_data_to_reducers(ReducerPids, ReducerPidsWithData),
+                                          [AliveReducerPids]),
+			send_data_to_reducers(AliveReducerPids, ReducerPidsWithData),
 			
 			error_logger:info_msg("Collecting acknowledgements from "
-                                              "reducers ~p...", [ReducerPids]),
-			collect_acknowledgements(ReducerPids),
+                                              "reducers ~p...", [AliveReducerPids]),
+			collect_acknowledgements(AliveReducerPids),
 			
 			error_logger:info_msg("Notifying master mapper ~p is done.", [self()]),
                     MasterPid ! {self(), map_send_finished},
 			
 			additional_reduce_phase(MapFunction, ReducerPidsWithData, FirstRecipe, [{DeadReducerPids, Recipe} | AdditionalRecipes]);
 		
-		{_, additional_map_phase} ->
+		{MasterPid, {additional_map_phase, AliveReducerPids}} ->
 			error_logger:info_msg("Additiona map phase started, waiting for map data ..."),
 			AdditionalMapResultList = map_data(MapFunction),
 			AdditionalMapResult = lists:flatten(AdditionalMapResultList),
@@ -143,6 +141,17 @@ additional_reduce_phase(MapFunction, OldPartition, FirstRecipe, AdditionalRecipe
 			MergedPartition = dict:merge(fun (_, List1, List2) ->
 												  lists:append(List1, List2)
 										 end , AdditionalDataPartition, OldPartition),
+			
+			error_logger:info_msg("Sending data to reducers ~p...",
+                                          [AliveReducerPids]),
+			send_data_to_reducers(AliveReducerPids, MergedPartition),
+			
+			error_logger:info_msg("Collecting acknowledgements from "
+                                              "reducers ~p...", [AliveReducerPids]),
+			collect_acknowledgements(AliveReducerPids),
+			
+			error_logger:info_msg("Notifying master mapper ~p is done.", [self()]),
+                    MasterPid ! {self(), map_send_finished},
 			
 			additional_reduce_phase(MapFunction, MergedPartition, FirstRecipe, AdditionalRecipes)
 	end.

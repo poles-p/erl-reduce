@@ -99,7 +99,7 @@ master_mapper_fault_tolerance_one_mapper_missing_test() ->
                               ReduceWorkerPids,
                               InputData,
                               Recipe),
-    ExpectedResult = [{1, "a"}, {2, "b"}],
+    ExpectedResult = [{1, ["a"]}, {2, ["b"]}],
     ?assertEqual(lists:sort(ExpectedResult), lists:sort(ActualResult)),
 
     exit(MapWorkerPid2, kill),

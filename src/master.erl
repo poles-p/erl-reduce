@@ -11,11 +11,10 @@
 %% TODO: move partition_map_data/2 to a separate module.
 -export([run/5,
          partition_map_data/2,
-         execute_map_phase/3,   % exported for testing purposes.
          execute_reduce_phase/1 % exported for testing purporses.
         ]).
 
--record(master_state, {alive_mapper_pids, alive_reducer_pids, dead_mapper_pids = [], dead_reducer_pids = []}).
+-record(master_state, {alive_mapper_pids, alive_reducer_pids, dead_mapper_pids = [], dead_reducer_pids = [], data_partition}).
 
 %%
 %% API Functions.
@@ -34,9 +33,10 @@ run(MainWorkerPid, MapWorkerPids, ReduceWorkerPids, InputData, Recipe)
        length(ReduceWorkerPids) > 0 ->
     error_logger:info_msg("Starting master (~p).", [self()]),
 	State1 = #master_state{alive_mapper_pids = MapWorkerPids, 
-						  alive_reducer_pids = ReduceWorkerPids},
+						  alive_reducer_pids = ReduceWorkerPids,
+						  data_partition = create_data_partition(InputData, MapWorkerPids)},
 	create_monitors(State1),
-    State2 = execute_map_phase(InputData, State1, Recipe),
+    State2 = execute_map_phase(State1, Recipe),
     MapReduceResult = execute_reduce_phase(State2),
     MainWorkerPid ! {self(), {map_reduce_result, MapReduceResult}},
     map_reducing_complete(MapWorkerPids, ReduceWorkerPids),
@@ -63,6 +63,19 @@ create_monitors(State) ->
 		[State#master_state.alive_reducer_pids]),
 	spawn(monitors, monitor_reduce_workers, [self(), State#master_state.alive_reducer_pids]),
 	ok.
+
+%% @doc Creates partition of map data.
+%% @spec (MapData, MapWorkerPids) -> dict() where
+%%     MapData = [{K1,V1}],
+%%     MapWorkerPids = [pid()]
+%% @private
+create_data_partition(MapData, MapWorkerPids) ->
+	error_logger:info_msg("Partitioning"),
+	MapDataParts = partition_map_data(MapData, length(MapWorkerPids)),
+	
+	PidDatas = lists:zip(MapWorkerPids, MapDataParts),
+	
+	dict:from_list(PidDatas).
 
 %% @doc Partitions given Data into chunks of at most ChunkSize and appends
 %%     resulting chunk to the Accumulator. If there is at least ChunkSize
@@ -175,8 +188,15 @@ collect_map_finished_pids(PidDatas, State) ->
                          end, NewPidDatas),
            
            error_logger:info_msg("Data was sent, collecting again~n"),
+		   
+		   NewState = State2#master_state{dead_mapper_pids = [],
+										  data_partition = dict:merge(fun (_, Data1, Data2) ->
+																			   lists:append(Data1, Data2)
+																	  end,
+																	  State#master_state.data_partition, 
+																	  dict:from_list(NewPidDatas))},
            
-		   collect_map_finished_pids(NewPidDatas, State2#master_state{dead_mapper_pids = []});
+		   collect_map_finished_pids(NewPidDatas, NewState);
    
        true ->
            State2
@@ -191,32 +211,23 @@ collect_map_finished_pids(PidDatas, State) ->
 %%     Recipe = (K2) -> ReducerPid,
 %%     State = master_state
 %% @private
-execute_map_phase(MapData, State, Recipe) ->
+execute_map_phase(State, Recipe) ->
     error_logger:info_msg("Starting map phase with map workers ~p",
                           [State#master_state.alive_mapper_pids]),
     
-	error_logger:info_msg("Partitioning"),
-	
-	MapWorkerPids = State#master_state.alive_mapper_pids,
-    MapDataParts = partition_map_data(MapData, length(MapWorkerPids)),
-    
-    % Spread data among the map workers.
+	% Spread data among the map workers.
     error_logger:info_msg("Spreading map data among map workers ~p",
-                          [MapWorkerPids]),
-    error_logger:info_msg("length(MapWorkerPids): ~p~n"
-                              "length(MapDataParts):  ~p~n",
-                              [length(MapWorkerPids), length(MapDataParts)]),
+                          [State#master_state.alive_mapper_pids]),
     
-    PidDatas = lists:zip(MapWorkerPids, MapDataParts),
-    lists:foreach(fun ({A,B}) ->
-                           send_data_to_map_worker(A, B)
-                  end, PidDatas),
-    
+	dict:fold(fun (Pid, Data, _) ->
+					   send_data_to_map_worker(Pid, Data)
+			  end, ok, State#master_state.data_partition),
+	
     % Collect map_finished messages
     error_logger:info_msg("Collecting map_finished messages..."),
-    State2 = collect_map_finished_pids(PidDatas, State),
+    State2 = collect_map_finished_pids(dict:to_list(State#master_state.data_partition), State),
     error_logger:info_msg("Collected map_finished messages ~p out of ~p.",
-                          [length(State2#master_state.alive_mapper_pids), length(MapWorkerPids)]),    
+                          [length(State2#master_state.alive_mapper_pids), length(State#master_state.alive_mapper_pids)]),    
 	
     error_logger:info_msg("Sending mapping_phase_finished to all mappers"),
     
@@ -237,6 +248,73 @@ execute_map_phase(MapData, State, Recipe) ->
     error_logger:info_msg("Map phase finished.", []),
 	ResultState.
 
+execute_additional_map_phase(State) ->
+	AlivePids = State#master_state.alive_mapper_pids,
+	
+	lists:foreach(fun (Pid) ->
+						   Pid ! {self(), {additional_map_phase, State#master_state.alive_reducer_pids}}
+				  end, AlivePids),
+	
+	LostDatasList = lists:map(fun (Pid) ->
+									   dict:fetch(Pid, State#master_state.data_partition)
+							  end, State#master_state.dead_mapper_pids),
+	LostData = lists:flatten(LostDatasList),
+	
+	RepartitionedData = partition_map_data(LostData, length(AlivePids)),
+	PidsForRepartitionedData = lists:sublist(AlivePids, length(RepartitionedData)),
+
+	error_logger:info_msg("Mappers used for recomputation: ~p~n",
+                                 [PidsForRepartitionedData]),
+	NewPidDatas = lists:zip(PidsForRepartitionedData,
+							RepartitionedData),
+	lists:foreach(fun ({A,B}) ->
+						   send_data_to_map_worker(A, B)
+				  end, NewPidDatas),
+	
+	error_logger:info_msg("Data was sent, collecting again~n"),
+		
+	State2 = State#master_state{dead_mapper_pids = [],
+								data_partition = dict:merge(fun (_, Data1, Data2) ->
+																	 lists:append(Data1, Data2)
+															end,
+															State#master_state.data_partition,
+															dict:from_list(NewPidDatas))},
+	
+	State3 = collect_map_finished_pids(NewPidDatas, State2),
+	
+	error_logger:info_msg("Sending mapping_phase_finished to all mappers"),
+    
+	lists:foreach(fun (MapperPid) ->
+                           MapperPid ! {self(), mapping_phase_finished}
+                  end, State3#master_state.alive_mapper_pids),
+    
+	% Collect map_send_finished messages.
+    error_logger:info_msg("Collecting map_send_finished messages..."),
+	
+    collect_map_send_finished(State3#master_state.alive_mapper_pids, State3).
+
+%% @doc Collects data_canceled messages.
+%% @spec (RemainingReducerPids, State) -> State where
+%%    RemainingReducerPids = [pid()],
+%%    State = master_state
+%% @private
+collect_data_canceled([], State) ->
+	State;
+collect_data_canceled(RemainingReducerPids, State) ->
+	receive
+		{ReducerPid, data_canceled} ->
+			NewRemainingReducerPids = lists:delete(ReducerPid, RemainingReducerPids),
+			
+			collect_data_canceled(NewRemainingReducerPids, State);
+		
+		{ReducerPid, reduce_worker_down} ->
+			NewRemainingReducerPids = lists:delete(ReducerPid, RemainingReducerPids),			
+			NewState = reducer_failure_state_update(ReducerPid, State),
+			
+			collect_data_canceled(NewRemainingReducerPids, NewState)
+	end.
+	
+
 
 %% @doc Collects map_send_finished messages. When reducer is down, sends 
 %%    reduce_worker_down message to map workers.
@@ -245,7 +323,20 @@ execute_map_phase(MapData, State, Recipe) ->
 %%    State = master_state
 %% @private
 collect_map_send_finished([], State) ->
-	State; % TODO: tu jest miejsce na dodatkowe mapowanie z anulowaniem danych
+	case State#master_state.dead_mapper_pids of
+		[] -> State;
+		_ ->
+		   % cancel data from dead mappers.
+		   lists:foreach(fun (ReducerPid) ->
+								  ReducerPid ! {self(), {cancel_data, State#master_state.dead_mapper_pids}}
+						 end, State#master_state.alive_reducer_pids),
+		   
+		   % collect data_canceled messages
+		   State2 = collect_data_canceled(State#master_state.alive_reducer_pids, State),
+		   
+		   % additional map phase
+		   execute_additional_map_phase(State2)
+	end;
 collect_map_send_finished(MapWorkerPids, State) ->
 	receive
 		{MapperPid, map_send_finished} ->
@@ -310,7 +401,7 @@ execute_additional_reduce_phase(CollectedResults, DeadReducerPids, State) ->
 	error_logger:info_msg("Sending the recipe to mappers ~p", 
 						  [State#master_state.alive_mapper_pids]),
 	lists:foreach(fun (MapperPid) ->
-						   MapperPid ! {self(), {recipe, Recipe, DeadReducerPids}}
+						   MapperPid ! {self(), {recipe, Recipe, DeadReducerPids, State#master_state.alive_reducer_pids}}
 				  end, State#master_state.alive_mapper_pids),
 	
 	% Collect 'map_send_finished' messages
@@ -380,7 +471,7 @@ reducer_failure_state_update(ReducerPid, State) ->
 	AliveReducerPids = State#master_state.alive_reducer_pids,
 	DeadReducerPids  = State#master_state.dead_reducer_pids,
 	State#master_state{alive_reducer_pids = lists:delete(ReducerPid, AliveReducerPids),
-										  dead_reducer_pids = [ReducerPid | DeadReducerPids]}.
+					   dead_reducer_pids = [ReducerPid | DeadReducerPids]}.
 
 %% @doc Updates state after map wokrer failure. 
 %% @spec (MapperPid, State) -> State where
@@ -391,7 +482,7 @@ mapper_failure_state_update(MapperPid, State) ->
 	AliveMapperPids = State#master_state.alive_mapper_pids,
 	DeadMapperPids  = State#master_state.dead_mapper_pids,
 	State#master_state{alive_mapper_pids = lists:delete(MapperPid, AliveMapperPids),
-										  dead_reducer_pids = [MapperPid | DeadMapperPids]}.
+					   dead_mapper_pids = [MapperPid | DeadMapperPids]}.
 
 %% @doc Sends 'map_reducing_complete' message to all workers.
 %% @spec (MapWorkerPids, ReduceWorkerPids) -> () where
